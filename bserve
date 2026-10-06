@@ -1,0 +1,303 @@
+#!/bin/sh
+''''command -v python3 >/dev/null 2>&1 && exec python3 "$0" "$@"; exec python "$0" "$@" # '''
+"""bserve - BHT/1 static file server (see SPEC.md).
+
+Usage: bserve ROOT PORT
+
+One thread per connection; each connection carries any number of requests
+until the client closes it or it sits idle. Deliberately self-contained:
+it shares no code with bcurl, so the only thing the two agree on is the spec.
+"""
+
+import email.utils
+import mimetypes
+import os
+import socket
+import sys
+import threading
+import urllib.parse
+
+PREFACE = b"BHT\x01"                       # SPEC 1
+FRAME_HEADER_LEN = 8                       # SPEC 2
+TYPE_DATA, TYPE_HEADERS = 0x00, 0x01       # SPEC 3
+FLAG_END_STREAM = 0x01
+CHUNK = 16 * 1024                          # DATA payload size we send
+IDLE_TIMEOUT = 60                          # SPEC 1: MAY close after 60 s idle
+SERVER_NAME = b"bserve/1.0"
+
+# SPEC 4. Code 0 means "literal name follows"; 0x0B-0xFF are reserved.
+STATIC_TABLE = [None, ":method", ":path", ":status", "host", "user-agent",
+                "accept", "content-type", "content-length", "server", "date"]
+NAME_TO_CODE = {name: code for code, name in enumerate(STATIC_TABLE) if name}
+
+REASONS = {400: "Bad Request", 404: "Not Found",
+           405: "Method Not Allowed", 500: "Internal Server Error"}
+
+
+class Malformed(Exception):
+    """Framing is fine but the contents break the spec: answer 400 (SPEC 6)."""
+
+
+class PeerGone(Exception):
+    """The client closed the connection, possibly mid-frame."""
+
+
+# ------------------------------------------------------------------ framing
+
+def recv_exact(sock, n):
+    # TCP is a byte stream: one recv() is not one frame, so loop until n bytes.
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(min(n - len(buf), 65536))
+        if not chunk:
+            raise PeerGone()
+        buf += chunk
+    return bytes(buf)
+
+
+def discard_exact(sock, n):
+    # Skipping an unknown frame must not mean buffering up to 16 MiB.
+    while n:
+        chunk = sock.recv(min(n, 65536))
+        if not chunk:
+            raise PeerGone()
+        n -= len(chunk)
+
+
+def read_frame(sock):
+    """Return (type, flags, stream, payload). For a frame type we do not know,
+    the payload is read and thrown away and None is returned (SPEC 3)."""
+    h = recv_exact(sock, FRAME_HEADER_LEN)
+    length = int.from_bytes(h[0:3], "big")
+    ftype, flags = h[3], h[4]
+    stream = int.from_bytes(h[5:8], "big")
+    if ftype not in (TYPE_DATA, TYPE_HEADERS):
+        discard_exact(sock, length)
+        return ftype, flags, stream, None
+    return ftype, flags, stream, recv_exact(sock, length)
+
+
+def encode_frame(ftype, flags, stream, payload):
+    return (len(payload).to_bytes(3, "big") + bytes([ftype, flags])
+            + stream.to_bytes(3, "big") + payload)
+
+
+# ------------------------------------------------------------ header blocks
+
+def valid_literal_name(raw):
+    # SPEC 4: non-empty, printable ASCII 0x21-0x7E, no uppercase.
+    return bool(raw) and all(0x21 <= b <= 0x7E and not 0x41 <= b <= 0x5A
+                             for b in raw)
+
+
+def decode_header_block(p):
+    fields, i = [], 0
+
+    def take(n):
+        nonlocal i
+        if i + n > len(p):
+            raise Malformed("header block truncated")
+        out = p[i:i + n]
+        i += n
+        return out
+
+    while i < len(p):
+        code = take(1)[0]
+        if code == 0x00:
+            raw = take(int.from_bytes(take(2), "big"))
+            if not valid_literal_name(raw):
+                raise Malformed("invalid literal name")
+            name = raw.decode("ascii")
+        elif code < len(STATIC_TABLE):
+            name = STATIC_TABLE[code]
+        else:
+            raise Malformed(f"reserved name code 0x{code:02X}")
+        fields.append((name, take(int.from_bytes(take(2), "big"))))
+    return fields
+
+
+def encode_header_block(fields):
+    out = bytearray()
+    for name, value in fields:
+        code = NAME_TO_CODE.get(name)
+        if code:
+            out.append(code)
+        else:
+            raw = name.encode("ascii")
+            out += b"\x00" + len(raw).to_bytes(2, "big") + raw
+        out += len(value).to_bytes(2, "big") + value
+    return bytes(out)
+
+
+# ------------------------------------------------------------- path mapping
+
+def has_bad_segment(path):
+    return any(seg in (".", "..") for seg in path.split("/"))
+
+
+def resolve(root, raw_path):
+    """Map a :path to a regular file under root, or None -> 404 (SPEC 5)."""
+    try:
+        path = raw_path.decode("ascii")
+        if not path.startswith("/"):
+            return None
+        path = path.split("?", 1)[0].split("#", 1)[0]
+        if has_bad_segment(path):
+            return None
+        path = urllib.parse.unquote(path, errors="strict")
+    except UnicodeDecodeError:
+        return None
+    if has_bad_segment(path) or any(c in path for c in "\x00\\:"):
+        return None
+    candidate = os.path.join(root, *[seg for seg in path.split("/") if seg])
+    if os.path.isdir(candidate):
+        candidate = os.path.join(candidate, "index.html")
+    real = os.path.realpath(candidate)
+    try:
+        # Catches links that resolve outside the root.
+        inside = os.path.commonpath([real, root]) == root
+    except ValueError:  # different drives on Windows
+        return None
+    return real if inside and os.path.isfile(real) else None
+
+
+# --------------------------------------------------------------- connection
+
+class Connection:
+    def __init__(self, sock, addr, root):
+        self.sock = sock
+        self.peer = f"{addr[0]}:{addr[1]}"
+        self.root = root
+        self.last_stream = 0
+
+    def log(self, msg):
+        print(f"[{self.peer}] {msg}", file=sys.stderr, flush=True)
+
+    def send(self, ftype, flags, stream, payload):
+        self.sock.sendall(encode_frame(ftype, flags, stream, payload))
+
+    def send_headers(self, stream, status, fields, end_stream):
+        block = encode_header_block(
+            [(":status", str(status).encode()), *fields,
+             ("server", SERVER_NAME),
+             ("date", email.utils.formatdate(usegmt=True).encode())])
+        self.send(TYPE_HEADERS, FLAG_END_STREAM if end_stream else 0,
+                  stream, block)
+
+    def send_error(self, stream, status, why, head=False):
+        body = f"{status} {REASONS[status]}\n".encode()
+        self.send_headers(stream, status,
+                          [("content-type", b"text/plain"),
+                           ("content-length", str(len(body)).encode())],
+                          end_stream=head)
+        if not head:
+            self.send(TYPE_DATA, FLAG_END_STREAM, stream, body)
+        self.log(f"#{stream} -> {status} ({why})")
+
+    def run(self):
+        self.sock.settimeout(IDLE_TIMEOUT)
+        try:
+            if recv_exact(self.sock, len(PREFACE)) != PREFACE:
+                self.log("bad preface, closing")  # SPEC 1: no reply
+                return
+            self.log("connected")
+            while True:
+                ftype, flags, stream, payload = read_frame(self.sock)
+                if payload is None:
+                    self.log(f"skipped unknown frame type 0x{ftype:02X}")
+                elif ftype == TYPE_HEADERS:
+                    self.on_request(flags, stream, payload)
+                # DATA from a client is discarded (SPEC 5).
+        except (PeerGone, OSError):  # includes timeouts and resets
+            pass
+        finally:
+            self.log("closed")
+            self.sock.close()
+
+    def on_request(self, flags, stream, payload):
+        try:
+            if stream == 0 or stream <= self.last_stream:
+                raise Malformed(f"stream id {stream} is not above {self.last_stream}")
+            self.last_stream = stream
+            if not flags & FLAG_END_STREAM:
+                raise Malformed("request HEADERS without END_STREAM")
+            pseudo = {}
+            for name, value in decode_header_block(payload):
+                if name.startswith(":"):
+                    if name not in (":method", ":path") or name in pseudo:
+                        raise Malformed(f"unexpected or repeated {name}")
+                    pseudo[name] = value
+            if len(pseudo) != 2:
+                raise Malformed("missing :method or :path")
+        except Malformed as e:
+            self.send_error(stream, 400, e)
+            return
+
+        method, path = pseudo[":method"], pseudo[":path"]
+        shown = f"{method.decode('latin-1')} {path.decode('latin-1')}"
+        if method not in (b"GET", b"HEAD"):
+            self.send_error(stream, 405, shown)
+            return
+        head = method == b"HEAD"
+        real = resolve(self.root, path)
+        if real is None:
+            self.send_error(stream, 404, shown, head)
+            return
+        try:
+            f = open(real, "rb")
+        except OSError as e:
+            self.send_error(stream, 500, f"{shown}: {e}", head)
+            return
+        # A read error after HEADERS has gone out cannot become a 500; it
+        # propagates and closes the connection, so the client sees no
+        # END_STREAM rather than a silently truncated body.
+        with f:
+            self.send_file(stream, f, real, head)
+        self.log(f"#{stream} {shown} -> 200")
+
+    def send_file(self, stream, f, real, head):
+        size = os.fstat(f.fileno()).st_size
+        ctype = mimetypes.guess_type(real)[0] or "application/octet-stream"
+        cur = b"" if head else f.read(CHUNK)
+        self.send_headers(stream, 200,
+                          [("content-type", ctype.encode()),
+                           ("content-length", str(size).encode())],
+                          end_stream=not cur)
+        # Read one chunk ahead so the last DATA frame is the one carrying
+        # END_STREAM, without loading the whole file into memory.
+        while cur:
+            nxt = f.read(CHUNK)
+            self.send(TYPE_DATA, 0 if nxt else FLAG_END_STREAM, stream, cur)
+            cur = nxt
+
+
+def main(argv):
+    if len(argv) != 3 or not argv[2].isdigit() or not 0 < int(argv[2]) < 65536:
+        print("usage: bserve ROOT PORT", file=sys.stderr)
+        return 2
+    root = os.path.realpath(argv[1])
+    if not os.path.isdir(root):
+        print(f"bserve: {argv[1]}: not a directory", file=sys.stderr)
+        return 2
+    port = int(argv[2])
+    # Listen on IPv6 and IPv4 together so "localhost" works whichever way
+    # it resolves.
+    if socket.has_dualstack_ipv6():
+        srv = socket.create_server(("", port), family=socket.AF_INET6,
+                                   dualstack_ipv6=True)
+    else:
+        srv = socket.create_server(("", port))
+    print(f"bserve: serving {root} on port {port}", file=sys.stderr, flush=True)
+    try:
+        while True:
+            sock, addr = srv.accept()
+            threading.Thread(target=Connection(sock, addr, root).run,
+                             daemon=True).start()
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        srv.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
