@@ -1,13 +1,16 @@
 #!/bin/sh
 ''''command -v python3 >/dev/null 2>&1 && exec python3 "$0" "$@"; exec python "$0" "$@" # '''
-"""bserve - BHT/1 static file server (see SPEC.md).
-
-Usage: bserve ROOT PORT
-
-One thread per connection; each connection carries any number of requests
-until the client closes it or it sits idle. Deliberately self-contained:
-it shares no code with bcurl, so the only thing the two agree on is the spec.
-"""
+# Line 2 is a launcher so that ./bserve runs on any system. The shell runs it
+# and restarts this file under python3, or python if python3 is missing.
+# Python reads the same line as a harmless string and skips it.
+#
+# bserve - the BHT/1 static file server (see SPEC.md).
+#
+# Usage: bserve ROOT PORT
+#
+# One thread per connection; each connection carries any number of requests
+# until the client closes it or it sits idle. Deliberately self-contained:
+# it shares no code with bcurl, so the only thing the two agree on is the spec.
 
 import email.utils
 import mimetypes
@@ -282,11 +285,15 @@ def main(argv):
     port = int(argv[2])
     # Listen on IPv6 and IPv4 together so "localhost" works whichever way
     # it resolves.
-    if socket.has_dualstack_ipv6():
-        srv = socket.create_server(("", port), family=socket.AF_INET6,
-                                   dualstack_ipv6=True)
-    else:
-        srv = socket.create_server(("", port))
+    try:
+        if socket.has_dualstack_ipv6():
+            srv = socket.create_server(("", port), family=socket.AF_INET6,
+                                       dualstack_ipv6=True)
+        else:
+            srv = socket.create_server(("", port))
+    except OSError as e:
+        print(f"bserve: cannot listen on port {port}: {e.strerror}", file=sys.stderr)
+        return 1
     print(f"bserve: serving {root} on port {port}", file=sys.stderr, flush=True)
     try:
         while True:

@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local-only files
+*.cmd
+SPEC.pdf
+
+# Editor and OS files
+.vscode/
+desktop.ini
+Thumbs.db
+.DS_Store
