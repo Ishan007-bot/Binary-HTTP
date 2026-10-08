@@ -1,0 +1,10 @@
+# Git on Windows (core.autocrlf=true) converts line endings to CRLF on
+# checkout. These files must arrive exactly as committed.
+
+# Launch scripts: a CRLF would break their "#!/bin/sh" first line.
+bserve text eol=lf
+bcurl  text eol=lf
+
+# Served files must reach the client byte for byte. www/index.html is the
+# exact 12-byte file used in SPEC.md and HEXDUMP.md, so never convert it.
+www/** -text
