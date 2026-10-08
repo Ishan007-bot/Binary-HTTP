@@ -30,8 +30,9 @@ share no code, so they only work together if the spec is right.
 │   ├── sub/index.html
 │   ├── empty.txt    0 bytes: tests a response with no body
 │   └── big.bin      40,000 bytes: tests a body split across several frames
-└── tests/
-    └── probe.py     55 automated tests (server, client, and the two together)
+├── tests/
+│   └── probe.py     55 automated tests (server, client, and the two together)
+└── screenshots/     images used in this README
 ```
 
 `bserve` and `bcurl` have no `.py` extension because the assignment names the
@@ -53,6 +54,8 @@ library is used.
 $ ./bserve ./www 9000
 bserve: serving /path/to/project/www on port 9000
 ```
+
+![bserve running on port 9000](screenshots/01-server-running.png)
 
 **2. In a second terminal, fetch a file:**
 
@@ -99,6 +102,8 @@ $ ./bcurl -v localhost:9000/index.html
     0010  68 31 3e 0a                                       |h1>.|
 <h1>hi</h1>
 ```
+
+![bcurl -v hexdump of one request and response](screenshots/02-bcurl-verbose.png)
 
 [HEXDUMP.md](HEXDUMP.md) explains every one of those bytes.
 
@@ -173,6 +178,8 @@ Ran 55 tests in 13.210s
 
 OK (skipped=1)
 ```
+
+![All 55 tests passing](screenshots/03-tests-passing.png)
 
 The suite starts its own `bserve` on a free port and serves temporary test
 files. It stops the server when it finishes. It contains:
